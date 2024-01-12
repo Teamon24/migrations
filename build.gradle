@@ -90,18 +90,16 @@ ext {
             ]
     ]
 
-    def apiPropertiesFilenameRegex = '^.*application([-_a-zA-Z0-9]*).properties$'
-    def defaultApiPropertiesFilename = 'application.properties'
+    def apiPropertiesPrefix = 'application'
+    def propertiesExtension = 'properties'
+    def apiPropertiesFilenameRegex = "^.*$apiPropertiesPrefix([-_a-zA-Z0-9]*).$propertiesExtension\$"
+    def defaultApiPropertiesFilename = "$apiPropertiesPrefix.$propertiesExtension"
     def defaultApiProfile = "default"
     def resources = api.paths.resources()
 
+    // ------------------------------------ Scanning api properties ------------------------------------
     Files.walk(Paths.get(resources))
-            .sorted((path1, path2) -> {
-                println "$path1 ? $path2"
-                if (path1.endsWith(defaultApiPropertiesFilename)) { return Integer.MIN_VALUE }
-                if (path2.endsWith(defaultApiPropertiesFilename)) { return Integer.MAX_VALUE }
-                return path1 <=> path2
-            })
+            .sorted(alwaysFirst(defaultApiPropertiesFilename))
             .forEach {
                 if (it.toString().matches(apiPropertiesFilenameRegex)) {
                     def profileSuffix = extractGroup(apiPropertiesFilenameRegex, it.toString())
@@ -112,7 +110,7 @@ ext {
                         api.props.default.values = getProperties(api.props.default.filepath)
                     } else {
                         api.props[profile] = [:]
-                        api.props[profile].filepath = slpath(resources, "application-${profile}.properties")
+                        api.props[profile].filepath = slpath(resources, "$apiPropertiesPrefix-${profile}.$propertiesExtension")
                         api.props[profile].values = apiPropertiesProfile(api.props.default.values, api.props[profile].filepath)
                     }
                 }
@@ -128,6 +126,8 @@ ext {
     }
 
     def final ABSENT_DB_TAG = '<ABSENT>'
+
+    // ------------------------------------ Liquibase settings map ------------------------------------
     liqui = [
             extension : lazy {
                 findProperty("changelogExtension", implementedExtension).with {
@@ -295,6 +295,14 @@ ext {
                     level                  : 'debug',
             ]
     ]
+}
+
+private Closure<Integer> alwaysFirst(defaultApiPropertiesFilename) {
+    (path1, path2) -> {
+        if (path1.endsWith(defaultApiPropertiesFilename)) { return Integer.MIN_VALUE }
+        if (path2.endsWith(defaultApiPropertiesFilename)) { return Integer.MAX_VALUE }
+        return path1 <=> path2
+    }
 }
 
 String executeSql(String workingDir, String query) {
