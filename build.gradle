@@ -1,0 +1,723 @@
+import com.fasterxml.jackson.databind.ObjectWriter
+
+import java.nio.file.FileSystems
+import java.nio.file.Files
+import java.nio.file.Path
+import java.nio.file.Paths
+import java.text.SimpleDateFormat
+import java.util.regex.MatchResult
+import java.util.regex.Matcher
+import java.util.regex.Pattern
+import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.annotation.JsonAutoDetect;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.core.type.TypeReference;
+import org.apache.commons.lang3.StringUtils
+import org.apache.commons.lang3.RandomStringUtils
+import org.apache.commons.text.StringSubstitutor
+
+import static Lazy.lazy
+import static Func.func
+
+buildscript {
+    ext {
+        fileSystemSeparator = FileSystems.getDefault().separator
+        excludePath = findProperty('excludePath')
+        apiDir = "$rootDir".replace(excludePath, '')
+        println " --- API            : apiDir             --- $apiDir"
+        println " --- PROJECT        : project.projectDir --- $project.projectDir"
+        println " --- ROOT           : rootDir            --- $rootDir"
+        println " --- FILE SEPARATOR : separator          --- $fileSystemSeparator"
+    }
+
+    dependencies {
+        def separator = FileSystems.getDefault().getSeparator()
+        classpath files(String.join(separator, "$apiDir", "src", "main"))
+        classpath 'com.fasterxml.jackson.core:jackson-databind:2.16.0'
+        classpath 'org.apache.commons:commons-lang3:3.12.0'
+        classpath 'org.apache.commons:commons-text:1.10.0'
+    }
+}
+
+plugins {
+    id 'java'
+    id 'org.springframework.boot' version '3.2.0'
+    id 'io.spring.dependency-management' version '1.1.4'
+    id 'org.liquibase.gradle' version '2.2.1'
+}
+
+java {
+    sourceCompatibility = '17'
+}
+
+repositories {
+    mavenCentral()
+}
+
+def ____________________________EXTENSIONS_BLOCK____________________________() {}
+
+ext {
+    api = [
+            version : getApiProjectProperty('version'),
+            paths: [
+                    root                    : apiDir,
+                    logs                    : lazy { slpath(api.paths.root   , 'logs') },
+                    src                     : lazy { slpath(api.paths.root   , 'src') },
+                    main                    : lazy { slpath(api.paths.src()  , 'main') },
+                    java                    : lazy { slpath(api.paths.main() , 'java') },
+                    resources               : lazy { slpath(api.paths.main() , 'resources') },
+
+                    build                   : [
+                            it    : lazy { slpath(api.paths.root, 'build') },
+                            source: lazy { slpath(api.paths.build.it(), 'classes', 'java', 'main') }
+                    ],
+
+                    database                : lazy { slpath(api.paths.root, 'deploy', 'database') },
+                    migrations              : [
+                            it: lazy { slpath(api.paths.database(), 'migrations', 'src') },
+                            up: lazy { slpath(api.paths.migrations.it(), 'up') }
+                    ],
+            ],
+
+            props : [
+                    default: [
+                            name    : "application.properties",
+                            filepath: lazy { slpath(api.paths.resources(), api.props.default.name) },
+                    ],
+                    dev    : [
+                            name    : "application-dev.properties",
+                            filepath: lazy { slpath(api.paths.resources(), api.props.dev.name) },
+                    ]
+            ]
+    ]
+
+    api.props.with {
+        it.default.values = getProperties(it.default.filepath())
+        it.dev.values = applicationPropertiesDev(it.default.values, it.dev.filepath())
+    }
+
+    applicationProperties = api.props.dev.values
+
+    def implementedExtension = "sql"
+
+    def extension = findProperty("changelogExtension", implementedExtension).with {
+        if (it != implementedExtension) {
+            throwNotImplementedExtension(it)
+        }
+        it
+    }
+
+    def migrationNameTemplate = "%s-v%s-%s-[%s]--[%s].%s"
+    def migrationName = {
+        prefix, version, migrationNumber, dbTag, time, extnsn ->
+            String.format(migrationNameTemplate, prefix, version, migrationNumber, dbTag, time, extnsn)
+    }
+    def final ABSENT_DB_TAG = '<ABSENT>'
+    liqui = [
+            extension : extension,
+            database  : [
+                    username : applicationProperties["spring.datasource.username"],
+                    password : applicationProperties["spring.datasource.password"],
+                    driver   : applicationProperties["spring.datasource.driver-class-name"],
+                    url      : applicationProperties.with { substitute(it, "spring.datasource.url") },
+                    reference: [
+                            url: "hibernate:spring:${applicationProperties["liquibase.hibernate.entities.path"]}?" +
+                                    "dialect=${applicationProperties["spring.jpa.properties.hibernate.dialect"]}"
+                    ]
+            ],
+            changelog : [
+                    path    : api.paths.migrations.it(),
+                    filename: "changelog.$extension",
+                    filepath: lazy { liqui.changelog.with { slpath(it.path, "${it.filename}") } },
+            ],
+            migrations: [
+                    tag           : [
+                            prefix: "db-tag",
+                            db    : [
+                                    changelogTable: 'databasechangelog',
+                                    psqlCommand   : lazy {
+                                        liqui.database.with {
+                                            "psql ${it.url.replace('jdbc:', '')}?user=${it.username}&password=${it.password}"
+                                        }
+                                    },
+                                    query         : [
+                                            lastTag    : lazy {
+                                                liqui.migrations.tag.db.with {
+                                                    "SELECT max(${it.changelogTable}.tag) FROM ${it.changelogTable}" as String
+                                                }
+                                            },
+                                            tableExists: lazy {
+                                                "SELECT FROM pg_tables WHERE tablename = '$liqui.migrations.tag.db.changelogTable'"
+                                            }
+                                    ],
+                                    it            : lazy {
+                                        def apiDir = api.paths.root
+                                        liqui.migrations.tag.db.with {
+                                            def queries = it.query
+                                            executeSql(apiDir, queries.tableExists()).with {
+                                                if (!it.isBlank()) {
+                                                    executeSql(apiDir, queries.lastTag()).with {
+                                                        return it.isBlank() ? ABSENT_DB_TAG : it
+                                                    }
+                                                } else {
+                                                    return ABSENT_DB_TAG
+                                                }
+                                            }
+                                        }
+                                    }
+                            ],
+
+                            api   : [
+                                    branch  : lazy { execute(api.paths.root, 'git rev-parse --abbrev-ref HEAD') },
+                                    filename: "tags.json",
+                                    filepath: lazy { slpath(api.paths.database(), liqui.migrations.tag.api.filename) },
+                                    all     : lazy {
+                                        new ObjectMapper().readValue(
+                                                new FileReader(liqui.migrations.tag.api.filepath()),
+                                                new TypeReference<List<TagJsonPojo>>() {}
+                                        )
+                                    },
+                                    current : lazy {
+                                        liqui.migrations.tag.api.all().last()
+                                    },
+                                    random  : RandomStringUtils.randomAlphanumeric(10),
+                                    new     : lazy {
+                                        def prefix = liqui.migrations.tag.prefix
+                                        def lastTagName = liqui.migrations.tag.api.last()
+                                        if (lastTagName == null) {
+                                            "1-$prefix"
+                                        } else {
+                                            def newTagNumber = Integer.valueOf(lastTagName.replace("-$prefix", '')) + 1
+                                            "$newTagNumber-$prefix"
+                                        }
+                                    },
+                                    last    : lazy {
+                                        liqui.migrations.tag.with {
+                                            def tags = it.api.all()
+                                            if (tags.size() > 0) {
+                                                def lastTagPojo = tags.last()
+                                                return lastTagPojo.getName()
+                                            } else {
+                                                return null
+                                            }
+                                        }
+                                    }
+                            ]
+                    ],
+
+                    timeFormat    : "yyyy-MM-dd___HH-mm-ss",
+                    relativePath  : slpath('deploy', 'database', 'migrations', 'src'),
+                    masterFilepath: lazy { slpath(liqui.migrations.relativePath, "db.changelog-master.yaml") },
+                    path          : lazy { slpath(api.paths.root, liqui.migrations.relativePath) },
+
+                    down          : [
+                            path        : lazy { slpath(liqui.migrations.path(), 'down') },
+                            relativePath: lazy { slpath(liqui.migrations.relativePath, 'down') },
+                            filename    : lazy { upFilename ->
+                                liqui.extension.with { upFilename.replace(".$it", "-down.$it") }
+                            },
+                            filepath    : lazy { upFilename -> liqui.migrations.down.with { slpath(it.path(), it.filename(upFilename)) } }
+                    ],
+                    up            : [
+                            prefix    : 'migration',
+                            path      : lazy { slpath(liqui.migrations.path(), 'up') },
+                            lastNumber: lazy {
+                                def prefix = liqui.migrations.up.prefix
+                                def dbTagPrefix = liqui.migrations.tag.prefix
+                                def replaced = migrationNameTemplate
+                                        .replace('.', '\\.')
+                                        .replace('[', '\\[')
+
+                                def regex = String.format(
+                                        replaced,
+                                        prefix, '[\\d\\.]*', '(\\d*)', "\\d*-$dbTagPrefix", '.*', liqui.extension
+                                )
+
+                                lastMigrationNumber(api.paths.migrations.up(), regex, "$prefix-")
+                            },
+                            template  : lazy { time ->
+                                def extnsn = liqui.extension
+                                def version = api.version
+                                liqui.migrations.with {
+                                    def migrationNumber = it.up.lastNumber() + 1
+                                    migrationName(it.up.prefix, version, migrationNumber, it.tag.api.new(), time, extnsn)
+                                }
+                            },
+                            filename  : lazy { time -> "${it.up.template(time)}" },
+                            filepath  : lazy { time ->
+                                liqui.migrations.with { slpath(it.path(), 'up', it.up.template(time)) }
+                            },
+                            uppendix  : (String downFilename, String author, String id) -> {
+                                def disabled = Boolean.valueOf(findProperty("noDownMigration", "false"))
+                                if (!disabled) {
+                                    "-- rollback " +
+                                            "changesetId:$id " +
+                                            "changesetAuthor:$author " +
+                                            "changesetPath:" +
+                                            "${slpath(liqui.migrations.down.relativePath(), downFilename)}"
+                                }
+                            }
+                    ]
+            ],
+            activities: [
+                    main     : "main",
+                    migration: "createMigrationByEntities",
+                    drop     : "dropDatabase",
+                    update   : "updateDatabaseToTheLastMigration",
+                    rollback : "rollbackDatabaseToLastMigration",
+                    tag      : "tagDatabase",
+                    runnable : lazy { findProperty("enabledActivities") }
+            ],
+            logs      : [
+                    filepath               : slpath(api.paths.logs(), 'liquibase.log'),
+                    outputChangeLogFilepath: slpath(api.paths.migrations.it(), "output.txt"),
+                    level                  : 'debug',
+            ]
+    ]
+
+    println liqui.migrations.tag.db.it()
+}
+
+private String result(String workingDir, String[] lastDtTagCommandLine) {
+    return
+}
+
+String executeSql(String workingDir, String query) {
+    def psqlCommand = liqui.migrations.tag.db.psqlCommand()
+    def sqlFlag = '-c'
+    def onlyValueFlag = '-t'
+    String[] commandLine = psqlCommand.split('\\s') + onlyValueFlag + sqlFlag + query
+    return execute(workingDir, commandLine).split('\n')[0]
+}
+
+String getApiProjectProperty(String propertyName) {
+    def apiProjectProperties = execute(apiDir, './gradlew properties -q').split('\n').toList()
+    apiProjectProperties.stream()
+            .filter { it.matches("^${propertyName}: .*\$") }
+            .findFirst()
+            .orElseThrow { new RuntimeException("There is no property 'version' in api project") }
+            .with {
+                return it.split(':')[1].trim()
+            }
+}
+
+void throwNotImplementedExtension(extension) {
+    def message = "There is no implementation for extension: '${extension}'"
+    throw new RuntimeException(message)
+}
+
+//def lazy(Closure closure) { return new Function() { Object apply(Object o) { return closure.call(o) }}}
+
+def ____________________________DEPENDENCIES_BLOCK____________________________() {}
+
+dependencies {
+    liquibaseRuntime 'javax.xml.bind:jaxb-api:2.3.0'
+    liquibaseRuntime 'org.liquibase:liquibase-core:4.4.0'
+    liquibaseRuntime 'org.postgresql:postgresql:42.3.1'
+    liquibaseRuntime 'org.liquibase.ext:liquibase-hibernate6:4.25.0'
+    liquibaseRuntime 'org.springframework.data:spring-data-jdbc'
+    liquibaseRuntime 'org.springframework.data:spring-data-jpa'
+    liquibaseRuntime 'org.springframework.boot:spring-boot'
+    liquibaseRuntime sourceSets.main.output
+    liquibaseRuntime 'org.yaml:snakeyaml:1.26'
+    liquibaseRuntime 'info.picocli:picocli:4.6.1'
+}
+
+test {
+    useJUnitPlatform()
+}
+
+configurations {
+    liquibaseRuntime.extendsFrom runtimeClasspath
+}
+
+def ____________________________LIQUIBASE_SETTINGS____________________________() {}
+task liquibaseSettings(){}
+liquibaseSettings.doFirst {}
+    liquibase {
+        def runnable = liqui.activities.runnable
+
+        activities {
+            def migration = liqui.activities.migration;
+            def update = liqui.activities.update;
+            def rollback = liqui.activities.rollback;
+            def drop = liqui.activities.drop
+            def tag = liqui.activities.tag
+            def entitiesBuildpath = api.paths.build.source()
+            println "entities classpath: ${entitiesBuildpath}"
+            println "liqui.database.reference.url: ${liqui.database.reference.url}"
+
+            "${migration}" {
+                classpath entitiesBuildpath
+                generateChangesetCreatedValues "true"
+                changelogFile "${liqui.changelog.filepath()}"
+                url liqui.database.url
+                username liqui.database.username
+                password liqui.database.password
+                driver liqui.database.driver
+                referenceUrl liqui.database.reference.url
+                logfile liqui.logs.filepath
+                logLevel liqui.logs.level
+                labels liqui.migrations.label
+            }
+
+            "${update}" {
+                changelogFile "${liqui.migrations.masterFilepath()}"
+                url liqui.database.url
+                username liqui.database.username
+                password liqui.database.password
+                driver liqui.database.driver
+                logfile liqui.logs.filepath
+                logLevel liqui.logs.level
+            }
+
+            "${tag}" {
+                url liqui.database.url
+                username liqui.database.username
+                password liqui.database.password
+                driver liqui.database.driver
+                logfile liqui.logs.filepath
+                logLevel liqui.logs.level
+            }
+
+            "${rollback}" {
+                changelogFile "${liqui.migrations.masterFilepath()}"
+                url liqui.database.url
+                username liqui.database.username
+                password liqui.database.password
+                driver liqui.database.driver
+                logfile liqui.logs.filepath
+                logLevel liqui.logs.level
+            }
+
+            "${drop}" {
+                url liqui.database.url
+                username liqui.database.username
+                password liqui.database.password
+                driver liqui.database.driver
+                logfile liqui.logs.filepath
+                logLevel liqui.logs.level
+            }
+        }
+        runList = "${runnable()}"
+    }
+
+def ____________________________LIQUIBASE_TASKS____________________________() {}
+
+task compileApi() {
+    doFirst {
+        exec {
+            standardOutput = System.out
+            workingDir(apiDir)
+            commandLine './gradlew', 'compileJava'
+        }
+    }
+}
+
+
+task updateDatabase() {}
+
+liquibaseSettings.with {
+    updateDatabase.dependsOn(it)
+    updateDatabase.dependsOn(tag)
+
+    update.dependsOn(it)
+    update.doLast { project.ext["liquibaseCommandValue"] = "${liqui.migrations.tag.api.last()}" }
+
+    tag.with {
+        it.dependsOn(update)
+        it.doLast {
+            project.ext["liquibaseCommandValue"] = null
+        }
+    }
+
+    rollback.dependsOn(it)
+    dropAll.dependsOn(it)
+
+    compileApi.with {
+        generateChangelog.dependsOn(it)
+        diff.dependsOn(it)
+    }
+}
+
+diffChangelog.with {
+    it.dependsOn(compileApi)
+    it.dependsOn(liquibaseSettings)
+    it.doLast {
+        def apiDir = api.paths.root
+        liqui.with {
+            def formatter = new SimpleDateFormat(it.migrations.timeFormat)
+            def time = formatter.format(System.currentTimeMillis())
+
+            def branchName                      = it.migrations.tag.api.branch()
+            def apiTagsFilepath           = Paths.get(it.migrations.tag.api.filepath())
+            def changelogFilepath         = Paths.get(it.changelog.filepath())
+            def upMigrationFilepath       = Paths.get(it.migrations.up.filepath(time))
+            def downMigrationFilepathLazy       = lazy { filename -> it.migrations.down.filepath(filename) }
+            def downMigrationFilepath     = Paths.get(downMigrationFilepathLazy(upMigrationFilepath.toFile().name))
+
+            println "Creating migrations."
+            println "Api branch                : $branchName"
+            println "Api tags                  : $apiTagsFilepath"
+            println "Changelog(wil be deleted) : $changelogFilepath"
+            println "Up-migrations             : $upMigrationFilepath"
+            println "Down-migrations           : $downMigrationFilepath"
+
+            //Creation of up-migration file
+            Files.copy(changelogFilepath, upMigrationFilepath)
+
+            def createUppendix = it.migrations.up.uppendix
+            processUpMigration(upMigrationFilepath).with {
+                def migrationId = it[1]
+                def migrationAuthor = it[0]
+                println "migration id     : $migrationId"
+                println "migration author : $migrationAuthor"
+                def uppendix = createUppendix(downMigrationFilepath.toFile().name, migrationAuthor, migrationId)
+                append(upMigrationFilepath, uppendix)
+            }
+            
+            //Creation of down-migration file
+            Files.createFile(downMigrationFilepath)
+            Files.delete(changelogFilepath)
+
+            appendUpMigrationRelativeFilepathToDatabaseChangelog(
+                    apiDir, it.migrations.masterFilepath(), upMigrationFilepath)
+
+            //Creation of down-migration file
+            writeNewTag(
+                    apiTagsFilepath,
+                    it.migrations.tag.api.all(),
+                    it.migrations.tag.api.new(),
+                    branchName,
+                    formatter
+            )
+        }
+    }
+}
+
+void appendUpMigrationRelativeFilepathToDatabaseChangelog(apiDir, masterFilepath, upMigrationFilepath) {
+    def upMigrationRelativeFilepath = upMigrationFilepath.toString().with { it.replace(apiDir, '') }
+    def spaces = { Integer i -> " ".repeat(i)}
+    def i = 2
+    append(Paths.get(masterFilepath), "${spaces(i)}- include:\n${spaces(i * 3)}file: $upMigrationRelativeFilepath")
+}
+
+void writeNewTag(apiTagsFilepath, tags, newTagName, branchName, formatter) {
+    def pojo = new TagJsonPojo(
+            newTagName,
+            branchName,
+            formatter.format(new Date(System.currentTimeMillis()))
+    )
+    tags.add(pojo)
+    def printer = new ObjectMapper().writerWithDefaultPrettyPrinter()
+    Files.write(apiTagsFilepath, printer.writeValueAsString(tags).bytes)
+}
+
+String execute(String workDir, String command) {
+    return execute(workDir, command.split('\\s'))
+}
+
+String execute(String workDir, String[] command) {
+    def baos = new ByteArrayOutputStream()
+    println "Executing: $command"
+    exec {
+        workingDir(workDir)
+        commandLine(command)
+        standardOutput = baos;
+    }
+
+    def result = StringUtils.removeEnd(baos.toString(), "\n")
+    baos.close()
+    return result;
+}
+
+String slpath(String... pathParts) {
+    return String.join(FileSystems.getDefault().getSeparator(), pathParts)
+}
+
+String slpath(String path, List<String> pathParts) {
+    def temp = new ArrayList(pathParts)
+    temp.add(0, path)
+    return String.join(FileSystems.getDefault().getSeparator(), temp)
+}
+
+String substitute(Properties properties, String propertyName) {
+    def propertyValue = properties[propertyName]
+    String regex = '\\$\\{([A-Za-z0-9.]+)}';
+    String[] keys = Pattern.compile(regex)
+            .matcher(propertyValue)
+            .results()
+            .map(MatchResult::group)
+            .map(key -> key.replaceAll('[${}]', ''))
+            .toArray(String[]::new);
+
+    Object[] values = new String[keys.length];
+
+    for (int i = 0; i < keys.length; i++) {
+        values[i] = properties.get(keys[i]);
+    }
+
+    String template = propertyValue.replaceAll(regex, "%s");
+    properties[propertyName] = template.formatted(values);
+}
+
+String findProperty(String propertyName) {
+    return findProperty(propertyName, null)
+}
+
+String findProperty(String propertyName, String defaultValue) {
+    return propertyName.with {
+        def property = project.properties.get(it)
+        if (property == null) property = System.properties.get(it)
+        if (property == null) property = defaultValue
+        if (property == null) throw new RuntimeException("Property '$it' is not in project, system or default properties.")
+        property
+    }
+}
+
+Properties applicationPropertiesDev(Properties applicationProperties, String applicationPropertiesPath) {
+    return new Properties().with {
+        applicationProperties.forEach((k, v) -> it.put(k, v))
+        getProperties(applicationPropertiesPath).forEach((k, v) -> it.put(k, v))
+        it
+    }
+}
+
+Properties getProperties(String propertiesFilepath) {
+    return new Properties().with {
+        it.load(new File(propertiesFilepath).newReader())
+        it
+    }
+}
+
+String[] processUpMigration(Path filepath) {
+    def changeset = "-- changeset"
+
+    def occurance = filterLinesExcludingFirstOccurance(filepath, changeset)
+    occurance.with {
+        BufferedWriter bw = new BufferedWriter(new FileWriter(filepath.toFile()));
+        def lines = it.toList()
+        for (String str : (lines)) {
+            bw.write(str + System.lineSeparator());
+        }
+        bw.close();
+    }
+    return occurance.stream()
+            .filter(it -> it.contains(changeset))
+            .findFirst()
+            .orElseThrow(() -> new RuntimeException("There is no line that contains '$changeset'"))
+            .replace(changeset, '').trim().split(':')
+}
+
+List<String> filterLinesExcludingFirstOccurance(Path filepath, String filterValue) {
+    def counter = 0;
+    Files.lines(filepath).filter(line -> {
+        if (!line.contains(filterValue)) return true;
+        if (counter == 0) {
+            counter++
+            return true
+        } else {
+            return counter > 0 && !line.contains(filterValue)
+        }
+    }).toList()
+}
+
+public Integer lastMigrationNumber(String path, String regex, String prefix) {
+    lastMigrationNumber(Paths.get(path), regex, prefix)
+}
+
+public Integer lastMigrationNumber(Path path, String regex, String prefix) {
+    def walk = Files.walk(path)
+            .filter { it != path }
+            .toList()
+
+    if (walk.isEmpty()) {
+        return 0
+    } else {
+        String lastMigrationFilename = walk
+                .stream()
+                .filter(it -> it.toFile().getName().startsWith(prefix))
+                .max(Comparator.naturalOrder())
+                .orElseThrow(() -> new RuntimeException("There is no files start with %s in %s".formatted(prefix, path)))
+                .getFileName()
+                .toString();
+
+        Matcher matcher = Pattern
+                .compile(regex)
+                .matcher(lastMigrationFilename);
+        if (matcher.find()) {
+            return Integer.valueOf(matcher.group(1))
+        }
+
+        def template = "There is no found match for: regex - %s, string - %s"
+        throw new RuntimeException(template.formatted(regex, lastMigrationFilename));
+    }
+}
+
+void append(Path filepath, final String toAppend) throws IOException {
+    try (PrintWriter out = new PrintWriter(new BufferedWriter(new FileWriter(filepath.toFile(), true)))) {
+        out.println(toAppend);
+    } catch (IOException e) {
+        throw new RuntimeException(e);
+    }
+}
+
+@groovy.transform.CompileStatic
+class Lazy<T> extends Closure<T> {
+    @Delegate private Closure<T> closure
+    private T value
+    private Lazy(Closure c) { super(c.getOwner(), c.getThisObject()); this.closure = c }
+
+    T doCall()             { initValueIfAbsent() }
+    T doCall(Object o)     { initValueIfAbsent(o) }
+    T doCall(Object... os) { initValueIfAbsent(os) }
+
+    private T initValueIfAbsent(Object...os) {
+        if (value == null) {
+            if (os.length == 0) value = closure.call()
+            if (os.length == 1) value = closure.call(os[0])
+            if (os.length > 1) value = closure.call(os)
+        }
+        value
+    }
+
+    String toString() { closure.call() as String }
+
+    private static Lazy of(Closure c) { new Lazy(c) }
+    static Lazy lazy(Closure c) { of(c) }
+}
+
+@groovy.transform.CompileStatic
+class Func extends Closure {
+    @Delegate private Closure closure
+    private Func(Closure c) { super(c.getOwner(), c.getThisObject()); this.closure = c }
+    private static Func of(Closure c) { new Func(c) }
+    Object doCall() { return closure.call() }
+    Object doCall(Object o) { closure.call(o) }
+    Object doCall(Object... os) { closure.call(os) }
+    String toString() { closure.call() as String }
+    static Func func(Closure c) { of(c) }
+}
+
+@JsonAutoDetect(
+        fieldVisibility = JsonAutoDetect.Visibility.NONE,
+        setterVisibility = JsonAutoDetect.Visibility.NONE,
+        getterVisibility = JsonAutoDetect.Visibility.NONE,
+        isGetterVisibility = JsonAutoDetect.Visibility.NONE,
+        creatorVisibility = JsonAutoDetect.Visibility.NONE
+)
+class TagJsonPojo {
+    @JsonProperty String name;
+    @JsonProperty String feature;
+    @JsonProperty String date;
+
+    TagJsonPojo() {}
+
+    TagJsonPojo(String name, String feature, String date) {
+        this.name = name
+        this.date = date
+        this.feature = feature
+    }
+
+    String getName() { return name }
+}
