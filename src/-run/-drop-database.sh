@@ -1,5 +1,5 @@
 #!/bin/bash
 . ./database/migrations/src/-run/-utils.sh
 cd ..
-./gradlew dropAll $1 $(properties "dropDatabase")
+./gradlew dropAll $(properties "dev" "dropDatabase") $1
 

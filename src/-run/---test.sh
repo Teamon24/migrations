@@ -1,8 +1,4 @@
 #!/bin/bash
-EXCLUDE_PATH=/deploy/database/migrations
-
+. ./database/migrations/src/-run/-utils.sh
 cd ..
-./gradlew clean \
--b ."$EXCLUDE_PATH"/build.gradle \
--PexcludePath="$EXCLUDE_PATH" \
--PenabledActivities=createMigrationByEntities
+./gradlew clean $(properties "dev" "createMigrationByEntities") $1

@@ -3,6 +3,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
 import java.text.SimpleDateFormat
+import java.util.function.Predicate
 import java.util.regex.MatchResult
 import java.util.regex.Matcher
 import java.util.regex.Pattern
@@ -16,6 +17,8 @@ import org.apache.commons.text.StringSubstitutor
 import com.github.vertical_blank.sqlformatter.SqlFormatter
 import com.github.vertical_blank.sqlformatter.languages.Dialect
 
+import java.util.stream.Stream
+
 import static Lazy.lazy
 import static Func.func
 
@@ -24,10 +27,6 @@ buildscript {
         fileSystemSeparator = FileSystems.getDefault().separator
         excludePath = findProperty('excludePath')
         apiDir = "$rootDir".replace(excludePath, '')
-        println " --- API            : apiDir             --- $apiDir"
-        println " --- PROJECT        : project.projectDir --- $project.projectDir"
-        println " --- ROOT           : rootDir            --- $rootDir"
-        println " --- FILE SEPARATOR : separator          --- $fileSystemSeparator"
     }
 
     dependencies {
@@ -58,22 +57,28 @@ repositories {
 def ____________________________EXTENSIONS_BLOCK____________________________() {}
 
 ext {
+    println " --- API            : apiDir             --- ${apiDir}"
+    println " --- PROJECT        : project.projectDir --- $project.projectDir"
+    println " --- ROOT           : rootDir            --- $rootDir"
+    println " --- FILE SEPARATOR : separator          --- $fileSystemSeparator"
+
     api = [
-            version : getApiProjectProperty('version'),
+            profile : lazy { findProperty('profile') },
+            version : getApiProjectProperty(apiDir, 'version'),
             paths: [
-                    root                    : apiDir,
-                    logs                    : lazy { slpath(api.paths.root   , 'logs') },
-                    src                     : lazy { slpath(api.paths.root   , 'src') },
+                    root                    : lazy { apiDir },
+                    logs                    : lazy { slpath(api.paths.root()   , 'logs') },
+                    src                     : lazy { slpath(api.paths.root()   , 'src') },
                     main                    : lazy { slpath(api.paths.src()  , 'main') },
                     java                    : lazy { slpath(api.paths.main() , 'java') },
                     resources               : lazy { slpath(api.paths.main() , 'resources') },
 
                     build                   : [
-                            it    : lazy { slpath(api.paths.root, 'build') },
+                            it    : lazy { slpath(api.paths.root(), 'build') },
                             source: lazy { slpath(api.paths.build.it(), 'classes', 'java', 'main') }
                     ],
 
-                    database                : lazy { slpath(api.paths.root, 'deploy', 'database') },
+                    database                : lazy { slpath(api.paths.root(), 'deploy', 'database') },
                     migrations              : [
                             it: lazy { slpath(api.paths.database(), 'migrations', 'src') },
                             up: lazy { slpath(api.paths.migrations.it(), 'up') }
@@ -81,55 +86,69 @@ ext {
             ],
 
             props : [
-                    default: [
-                            name    : "application.properties",
-                            filepath: lazy { slpath(api.paths.resources(), api.props.default.name) },
-                    ],
-                    dev    : [
-                            name    : "application-dev.properties",
-                            filepath: lazy { slpath(api.paths.resources(), api.props.dev.name) },
-                    ]
+                    default: [:]
             ]
     ]
 
-    api.props.with {
-        it.default.values = getProperties(it.default.filepath())
-        it.dev.values = applicationPropertiesDev(it.default.values, it.dev.filepath())
-    }
+    def apiPropertiesFilenameRegex = '^.*application([-_a-zA-Z0-9]*).properties$'
+    def defaultApiPropertiesFilename = 'application.properties'
+    def defaultApiProfile = "default"
+    def resources = api.paths.resources()
 
-    applicationProperties = api.props.dev.values
+    Files.walk(Paths.get(resources))
+            .sorted((path1, path2) -> {
+                println "$path1 ? $path2"
+                if (path1.endsWith(defaultApiPropertiesFilename)) { return Integer.MIN_VALUE }
+                if (path2.endsWith(defaultApiPropertiesFilename)) { return Integer.MAX_VALUE }
+                return path1 <=> path2
+            })
+            .forEach {
+                if (it.toString().matches(apiPropertiesFilenameRegex)) {
+                    def profileSuffix = extractGroup(apiPropertiesFilenameRegex, it.toString())
+                    def profile
+                    if (profileSuffix.trim().isEmpty()) profile = defaultApiProfile else profile = profileSuffix.drop(1)
+                    if ("default" == profile) {
+                        api.props.default.filepath = slpath(resources, defaultApiPropertiesFilename)
+                        api.props.default.values = getProperties(api.props.default.filepath)
+                    } else {
+                        api.props[profile] = [:]
+                        api.props[profile].filepath = slpath(resources, "application-${profile}.properties")
+                        api.props[profile].values = apiPropertiesProfile(api.props.default.values, api.props[profile].filepath)
+                    }
+                }
+            }
+
+    apiProperties = api.props[api.profile()].values
 
     def implementedExtension = "sql"
-
-    def extension = findProperty("changelogExtension", implementedExtension).with {
-        if (it != implementedExtension) {
-            throwNotImplementedExtension(it)
-        }
-        it
-    }
-
     def migrationNameTemplate = "%s-v%s-%s-[%s]--[%s].%s"
     def migrationName = {
         prefix, version, migrationNumber, dbTag, time, extnsn ->
             String.format(migrationNameTemplate, prefix, version, migrationNumber, dbTag, time, extnsn)
     }
+
     def final ABSENT_DB_TAG = '<ABSENT>'
     liqui = [
-            extension : extension,
+            extension : lazy {
+                findProperty("changelogExtension", implementedExtension).with {
+                    if (it != implementedExtension) throwNotImplementedExtension(it)
+                    it
+                }
+            },
             database  : [
-                    username : applicationProperties["spring.datasource.username"],
-                    password : applicationProperties["spring.datasource.password"],
-                    driver   : applicationProperties["spring.datasource.driver-class-name"],
-                    url      : applicationProperties.with { substitute(it, "spring.datasource.url") },
+                    username : apiProperties["spring.datasource.username"],
+                    password : apiProperties["spring.datasource.password"],
+                    driver   : apiProperties["spring.datasource.driver-class-name"],
+                    url      : apiProperties.with { substitute(it, "spring.datasource.url") },
                     reference: [
-                            url: "hibernate:spring:${applicationProperties["liquibase.hibernate.entities.path"]}?" +
-                                    "dialect=${applicationProperties["spring.jpa.properties.hibernate.dialect"]}"
+                            url: "hibernate:spring:${apiProperties["liquibase.hibernate.entities.path"]}?" +
+                                    "dialect=${apiProperties["spring.jpa.properties.hibernate.dialect"]}"
                     ]
             ],
             changelog : [
                     path    : api.paths.migrations.it(),
-                    filename: "changelog.$extension",
-                    filepath: lazy { liqui.changelog.with { slpath(it.path, "${it.filename}") } },
+                    filename: lazy { "changelog.${liqui.extension()}" },
+                    filepath: lazy { liqui.changelog.with { slpath(it.path, "${it.filename()}") } },
             ],
             migrations: [
                     tag           : [
@@ -152,7 +171,7 @@ ext {
                                             }
                                     ],
                                     it            : lazy {
-                                        def apiDir = api.paths.root
+                                        def apiDir = api.paths.root()
                                         liqui.migrations.tag.db.with {
                                             def queries = it.query
                                             executeSql(apiDir, queries.tableExists()).with {
@@ -169,7 +188,7 @@ ext {
                             ],
 
                             api   : [
-                                    branch  : lazy { execute(api.paths.root, 'git rev-parse --abbrev-ref HEAD') },
+                                    branch  : lazy { execute(api.paths.root(), 'git rev-parse --abbrev-ref HEAD') },
                                     filename: "tags.json",
                                     filepath: lazy { slpath(api.paths.database(), liqui.migrations.tag.api.filename) },
                                     all     : lazy {
@@ -209,13 +228,13 @@ ext {
                     timeFormat    : "yyyy-MM-dd___HH-mm-ss",
                     relativePath  : slpath('deploy', 'database', 'migrations', 'src'),
                     masterFilepath: lazy { slpath(liqui.migrations.relativePath, "db.changelog-master.yaml") },
-                    path          : lazy { slpath(api.paths.root, liqui.migrations.relativePath) },
+                    path          : lazy { slpath(api.paths.root(), liqui.migrations.relativePath) },
 
                     down          : [
                             path        : lazy { slpath(liqui.migrations.path(), 'down') },
                             relativePath: lazy { slpath(liqui.migrations.relativePath, 'down') },
                             filename    : lazy { upFilename ->
-                                liqui.extension.with { upFilename.replace(".$it", "-down.$it") }
+                                liqui.extension().with { upFilename.replace(".$it", "-down.$it") }
                             },
                             filepath    : lazy { upFilename -> liqui.migrations.down.with { slpath(it.path(), it.filename(upFilename)) } }
                     ],
@@ -225,19 +244,20 @@ ext {
                             lastNumber: lazy {
                                 def prefix = liqui.migrations.up.prefix
                                 def dbTagPrefix = liqui.migrations.tag.prefix
+
                                 def replaced = migrationNameTemplate
                                         .replace('.', '\\.')
                                         .replace('[', '\\[')
 
-                                def regex = String.format(
+                                def upMigrationFilenameRegex = String.format(
                                         replaced,
-                                        prefix, '[\\d\\.]*', '(\\d*)', "\\d*-$dbTagPrefix", '.*', liqui.extension
+                                        prefix, '[\\d\\.]*', '(\\d*)', "\\d*-$dbTagPrefix", '.*', liqui.extension()
                                 )
 
-                                lastMigrationNumber(api.paths.migrations.up(), regex, "$prefix-")
+                                lastUpMigrationNumber(api.paths.migrations.up(), upMigrationFilenameRegex)
                             },
                             template  : lazy { time ->
-                                def extnsn = liqui.extension
+                                def extnsn = liqui.extension()
                                 def version = api.version
                                 liqui.migrations.with {
                                     def migrationNumber = it.up.lastNumber() + 1
@@ -275,12 +295,6 @@ ext {
                     level                  : 'debug',
             ]
     ]
-
-    println liqui.migrations.tag.db.it()
-}
-
-private String result(String workingDir, String[] lastDtTagCommandLine) {
-    return
 }
 
 String executeSql(String workingDir, String query) {
@@ -291,8 +305,8 @@ String executeSql(String workingDir, String query) {
     return execute(workingDir, commandLine).split('\n')[0]
 }
 
-String getApiProjectProperty(String propertyName) {
-    def apiProjectProperties = execute(apiDir, './gradlew properties -q').split('\n').toList()
+String getApiProjectProperty(String apiPath, String propertyName) {
+    def apiProjectProperties = execute(apiPath, './gradlew properties -q').split('\n').toList()
     apiProjectProperties.stream()
             .filter { it.matches("^${propertyName}: .*\$") }
             .findFirst()
@@ -409,7 +423,7 @@ task compileApi() {
     doFirst {
         exec {
             standardOutput = System.out
-            workingDir(apiDir)
+            workingDir(api.paths.root())
             commandLine './gradlew', 'compileJava'
         }
     }
@@ -445,7 +459,7 @@ diffChangelog.with {
     it.dependsOn(compileApi)
     it.dependsOn(liquibaseSettings)
     it.doLast {
-        def apiDir = api.paths.root
+        def apiDir = api.paths.root()
         liqui.with {
             def formatter = new SimpleDateFormat(it.migrations.timeFormat)
             def time = formatter.format(System.currentTimeMillis())
@@ -509,7 +523,7 @@ String formatSql(Path changelogFilepath) {
 
 void appendUpMigrationToDatabaseChangelog(apiDir, masterFilepath, upMigrationFilepath) {
     def upMigrationRelativeFilepath = upMigrationFilepath.toString().with { it.replace(apiDir, '') }
-    def spaces = { Integer i -> " ".repeat(i)}
+    def spaces = { Integer i -> " ".repeat(i) }
     def i = 2
     append(Paths.get(masterFilepath), "${spaces(i)}- include:\n${spaces(i * 3)}file: $upMigrationRelativeFilepath")
 }
@@ -587,10 +601,10 @@ String findProperty(String propertyName, String defaultValue) {
     }
 }
 
-Properties applicationPropertiesDev(Properties applicationProperties, String applicationPropertiesPath) {
+Properties apiPropertiesProfile(Properties apiProperties, String apiPropertiesPath) {
     return new Properties().with {
-        applicationProperties.forEach((k, v) -> it.put(k, v))
-        getProperties(applicationPropertiesPath).forEach((k, v) -> it.put(k, v))
+        apiProperties.forEach((k, v) -> it.put(k, v))
+        getProperties(apiPropertiesPath).forEach((k, v) -> it.put(k, v))
         it
     }
 }
@@ -634,11 +648,11 @@ List<String> filterLinesExcludingFirstOccurance(Path filepath, String filterValu
     }).toList()
 }
 
-Integer lastMigrationNumber(String path, String regex, String prefix) {
-    lastMigrationNumber(Paths.get(path), regex, prefix)
+Integer lastUpMigrationNumber(String path, String regex) {
+    lastUpMigrationNumber(Paths.get(path), regex)
 }
 
-Integer lastMigrationNumber(Path path, String regex, String prefix) {
+Integer lastUpMigrationNumber(Path path, String regex) {
     def walk = Files.walk(path)
             .filter { it != path }
             .toList()
@@ -648,23 +662,30 @@ Integer lastMigrationNumber(Path path, String regex, String prefix) {
     } else {
         String lastMigrationFilename = walk
                 .stream()
-                .filter(it -> it.toFile().getName().startsWith(prefix))
                 .max(Comparator.naturalOrder())
-                .orElseThrow(() -> new RuntimeException("There is no files start with %s in %s".formatted(prefix, path)))
+                .orElseThrow(() -> new RuntimeException("There is no up migration files in path: '%s'".formatted(path)))
                 .getFileName()
                 .toString();
 
-        Matcher matcher = Pattern
-                .compile(regex)
-                .matcher(lastMigrationFilename);
-        if (matcher.find()) {
-            return Integer.valueOf(matcher.group(1))
-        }
-
-        def template = "There is no found match for: regex - %s, string - %s"
-        throw new RuntimeException(template.formatted(regex, lastMigrationFilename));
+        String extracted = extractGroup(regex, lastMigrationFilename)
+        return Integer.valueOf(extracted)
     }
 }
+
+String extractGroup(String regex, String string) {
+    String extracted;
+    Matcher matcher = Pattern
+            .compile(regex)
+            .matcher(string);
+    if (matcher.find()) {
+        extracted = matcher.group(1)
+    } else {
+        def template = "There is no found match for: regex - %s, string - %s"
+        throw new RuntimeException(template.formatted(regex, string));
+    }
+    return extracted
+}
+
 
 static void append(Path filepath, final String toAppend) throws IOException {
     try (PrintWriter out = new PrintWriter(new BufferedWriter(new FileWriter(filepath.toFile(), true)))) {
