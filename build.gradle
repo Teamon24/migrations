@@ -1,5 +1,3 @@
-import com.fasterxml.jackson.databind.ObjectWriter
-
 import java.nio.file.FileSystems
 import java.nio.file.Files
 import java.nio.file.Path
@@ -15,6 +13,8 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import org.apache.commons.lang3.StringUtils
 import org.apache.commons.lang3.RandomStringUtils
 import org.apache.commons.text.StringSubstitutor
+import com.github.vertical_blank.sqlformatter.SqlFormatter
+import com.github.vertical_blank.sqlformatter.languages.Dialect
 
 import static Lazy.lazy
 import static Func.func
@@ -36,6 +36,7 @@ buildscript {
         classpath 'com.fasterxml.jackson.core:jackson-databind:2.16.0'
         classpath 'org.apache.commons:commons-lang3:3.12.0'
         classpath 'org.apache.commons:commons-text:1.10.0'
+        classpath 'com.github.vertical-blank:sql-formatter:2.0.4'
     }
 }
 
@@ -464,23 +465,17 @@ diffChangelog.with {
             println "Down-migrations           : $downMigrationFilepath"
 
             //Creation of up-migration file
+            Files.write(changelogFilepath, formatSql(changelogFilepath).bytes)
             Files.copy(changelogFilepath, upMigrationFilepath)
 
             def createUppendix = it.migrations.up.uppendix
-            processUpMigration(upMigrationFilepath).with {
-                def migrationId = it[1]
-                def migrationAuthor = it[0]
-                println "migration id     : $migrationId"
-                println "migration author : $migrationAuthor"
-                def uppendix = createUppendix(downMigrationFilepath.toFile().name, migrationAuthor, migrationId)
-                append(upMigrationFilepath, uppendix)
-            }
+            appendDownMigrationLink(upMigrationFilepath, downMigrationFilepath, createUppendix)
             
             //Creation of down-migration file
             Files.createFile(downMigrationFilepath)
             Files.delete(changelogFilepath)
 
-            appendUpMigrationRelativeFilepathToDatabaseChangelog(
+            appendUpMigrationToDatabaseChangelog(
                     apiDir, it.migrations.masterFilepath(), upMigrationFilepath)
 
             //Creation of down-migration file
@@ -495,7 +490,24 @@ diffChangelog.with {
     }
 }
 
-void appendUpMigrationRelativeFilepathToDatabaseChangelog(apiDir, masterFilepath, upMigrationFilepath) {
+List appendDownMigrationLink(upMigrationFilepath, downMigrationFilepath, createUppendix) {
+    processUpMigration(upMigrationFilepath).with {
+        def migrationId = it[1]
+        def migrationAuthor = it[0]
+        println "migration id     : $migrationId"
+        println "migration author : $migrationAuthor"
+        def uppendix = createUppendix(downMigrationFilepath.toFile().name, migrationAuthor, migrationId)
+        append(upMigrationFilepath, uppendix)
+    }
+}
+
+String formatSql(Path changelogFilepath) {
+    return SqlFormatter
+            .of(Dialect.PostgreSql)
+            .format(new File("$changelogFilepath").newReader().text)
+}
+
+void appendUpMigrationToDatabaseChangelog(apiDir, masterFilepath, upMigrationFilepath) {
     def upMigrationRelativeFilepath = upMigrationFilepath.toString().with { it.replace(apiDir, '') }
     def spaces = { Integer i -> " ".repeat(i)}
     def i = 2
@@ -622,11 +634,11 @@ List<String> filterLinesExcludingFirstOccurance(Path filepath, String filterValu
     }).toList()
 }
 
-public Integer lastMigrationNumber(String path, String regex, String prefix) {
+Integer lastMigrationNumber(String path, String regex, String prefix) {
     lastMigrationNumber(Paths.get(path), regex, prefix)
 }
 
-public Integer lastMigrationNumber(Path path, String regex, String prefix) {
+Integer lastMigrationNumber(Path path, String regex, String prefix) {
     def walk = Files.walk(path)
             .filter { it != path }
             .toList()
@@ -654,7 +666,7 @@ public Integer lastMigrationNumber(Path path, String regex, String prefix) {
     }
 }
 
-void append(Path filepath, final String toAppend) throws IOException {
+static void append(Path filepath, final String toAppend) throws IOException {
     try (PrintWriter out = new PrintWriter(new BufferedWriter(new FileWriter(filepath.toFile(), true)))) {
         out.println(toAppend);
     } catch (IOException e) {
