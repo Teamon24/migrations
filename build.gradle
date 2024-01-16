@@ -119,10 +119,10 @@ ext {
     apiProperties = api.props[api.profile()].values
 
     def implementedExtension = "sql"
-    def migrationNameTemplate = "%s-v%s-%s-[%s]--[%s].%s"
+    def migrationNameTemplate = "%s-%s-[v%s]-[%s]--[%s].%s"
     def migrationName = {
-        prefix, version, migrationNumber, dbTag, time, extnsn ->
-            String.format(migrationNameTemplate, prefix, version, migrationNumber, dbTag, time, extnsn)
+        prefix, migrationNumber, version, dbTag, time, extnsn ->
+            String.format(migrationNameTemplate, prefix, migrationNumber, version, dbTag, time, extnsn)
     }
 
     def final ABSENT_DB_TAG = '<ABSENT>'
@@ -251,7 +251,7 @@ ext {
 
                                 def upMigrationFilenameRegex = String.format(
                                         replaced,
-                                        prefix, '[\\d\\.]*', '(\\d*)', "\\d*-$dbTagPrefix", '.*', liqui.extension()
+                                        prefix, '(\\d*)', '[\\d\\.]*', "\\d*-$dbTagPrefix", '.*', liqui.extension()
                                 )
 
                                 lastUpMigrationNumber(api.paths.migrations.up(), upMigrationFilenameRegex)
@@ -261,7 +261,7 @@ ext {
                                 def version = api.version
                                 liqui.migrations.with {
                                     def migrationNumber = it.up.lastNumber() + 1
-                                    migrationName(it.up.prefix, version, migrationNumber, it.tag.api.new(), time, extnsn)
+                                    migrationName(it.up.prefix, migrationNumber, version, it.tag.api.new(), time, extnsn)
                                 }
                             },
                             filename  : lazy { time -> "${it.up.template(time)}" },
@@ -505,6 +505,7 @@ diffChangelog.with {
                     apiTagsFilepath,
                     it.migrations.tag.api.all(),
                     it.migrations.tag.api.new(),
+                    upMigrationFilepath.toFile().name,
                     branchName,
                     formatter
             )
@@ -536,9 +537,10 @@ void appendUpMigrationToDatabaseChangelog(apiDir, masterFilepath, upMigrationFil
     append(Paths.get(masterFilepath), "${spaces(i)}- include:\n${spaces(i * 3)}file: $upMigrationRelativeFilepath")
 }
 
-void writeNewTag(apiTagsFilepath, tags, newTagName, branchName, formatter) {
+void writeNewTag(apiTagsFilepath, tags, newTagName, migrationName, branchName, formatter) {
     def pojo = new TagJsonPojo(
             newTagName,
+            migrationName,
             branchName,
             formatter.format(new Date(System.currentTimeMillis()))
     )
@@ -749,13 +751,15 @@ class Func extends Closure {
 )
 class TagJsonPojo {
     @JsonProperty String name;
+    @JsonProperty String migrationName;
     @JsonProperty String feature;
     @JsonProperty String date;
 
     TagJsonPojo() {}
 
-    TagJsonPojo(String name, String feature, String date) {
+    TagJsonPojo(String name, String migrationName, String feature, String date) {
         this.name = name
+        this.migrationName = migrationName
         this.date = date
         this.feature = feature
     }
